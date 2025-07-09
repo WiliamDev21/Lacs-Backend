@@ -10,7 +10,7 @@ services:
 
   fastapi:
     build:
-      context: ..
+      context: .
       dockerfile: BackendFastAPI/Dockerfile
     depends_on:
       - mongo
