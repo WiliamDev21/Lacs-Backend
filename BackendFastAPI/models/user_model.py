@@ -1,0 +1,69 @@
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, validator
+import random
+import string
+import hashlib
+import os
+import re
+
+class UserBase(BaseModel):
+    nombre: str = Field(..., description="Nombre del usuario")
+    apellido_paterno: str = Field(..., description="Apellido paterno del usuario")
+    apellido_materno: str = Field(..., description="Apellido materno del usuario")
+    nickname: Optional[str] = Field(None, description="Nombre de usuario")
+    empresa: str = Field(..., description="Empresa del usuario")
+    email: Optional[str] = Field(None, description="Correo electrónico del usuario")
+    telefono: Optional[str] = Field(None, description="Teléfono del usuario")
+    rol: Literal['Administrador','Inspector','Supervisor','Operador','Empleado'] = Field(..., description="Rol del usuario")
+
+class UserDB(UserBase):
+    id: Optional[str] = Field(..., description="ID del usuario (ObjectId de MongoDB)")
+    password: str = Field(..., description="Contraseña del usuario")
+
+    def generate_password(self) -> str:
+        characters = string.ascii_letters + string.digits + string.punctuation
+        password = ''.join(random.choices(characters, k=12))
+        return password
+
+    def verify_password(self, password: str, hashed_password: str) -> bool:
+        salt, stored_hash = hashed_password.split(':')
+        salt = bytes.fromhex(salt)
+        new_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+        return new_hash.hex() == stored_hash
+
+    @validator('id')
+    def validate_objectid(cls, v):
+        if v is not None and not re.fullmatch(r"^[a-fA-F0-9]{24}$", v):
+            raise ValueError("El id debe ser un ObjectId válido de MongoDB (24 caracteres hexadecimales)")
+        return v
+
+class CreateUser(UserBase):
+    password: Optional[str] = Field(None, description="Contraseña del usuario")
+
+    def generate_nickname(self) -> str:
+        nickname = (
+            self.apellido_paterno.upper()[0] +
+            self.apellido_materno.upper()[0] +
+            self.nombre.upper()[0] +
+            self.empresa.upper()
+        )
+        random_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=3))
+        return nickname + random_suffix
+
+    def hash_password(self, password: str) -> str:
+        salt = os.urandom(16)
+        hashed_password = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+        return salt.hex() + ':' + hashed_password.hex()
+
+    async def save_to_db(self):
+        from services.database import DatabaseService
+        db = DatabaseService.get_db()
+        user_dict = self.dict()
+        user_dict["password"] = self.hash_password(self.password)
+        result = await db.users.insert_one(user_dict)
+        user_dict["id"] = str(result.inserted_id)
+        user_dict.pop("password")
+        return user_dict
+ 
+class UserResponse(UserBase):
+    nickname: str = Field(..., description="Nombre de usuario")
