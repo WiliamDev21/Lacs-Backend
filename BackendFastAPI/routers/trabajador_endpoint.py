@@ -8,7 +8,7 @@ from services.jwt_service import verify_access_token
 
 router = APIRouter(prefix="/trabajadores", tags=["trabajadores"])
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/users/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     payload = verify_access_token(token)
@@ -22,6 +22,7 @@ async def create_trabajador(trabajador: CreateTrabajador, current_user=Depends(g
     trabajador_dict = trabajador.dict()
     result = await db.trabajadores.insert_one(trabajador_dict)
     trabajador_dict["id"] = str(result.inserted_id)
+    trabajador_dict.pop("_id", None)  # Eliminar _id de MongoDB si existe
     return TrabajadorResponse(**trabajador_dict)
 
 @router.get("/{trabajador_id}", response_model=TrabajadorResponse)

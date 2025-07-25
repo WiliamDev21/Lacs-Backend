@@ -1,10 +1,9 @@
 from fastapi import FastAPI
 from services.database import DatabaseService
 from contextlib import asynccontextmanager
-from routers.router import all_routers
 from services.jwt_service import generate_and_store_secret_key
 import os
-
+from routers.router import add_cors_middleware, router
 
 @asynccontextmanager
 async def lifespan(_):
@@ -15,7 +14,7 @@ async def lifespan(_):
 
 
 app = FastAPI(lifespan=lifespan)
-for router in all_routers:
-    app.include_router(router)
+app.include_router(router= router)
+add_cors_middleware(app)
 
 

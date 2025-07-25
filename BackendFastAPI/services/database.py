@@ -15,3 +15,8 @@ class DatabaseService:
         if cls._db is None:
             raise Exception("Database not connected. Call connect() first.")
         return cls._db
+
+# Función de dependencia para FastAPI
+def get_database():
+    """Función de dependencia para obtener la base de datos en los endpoints"""
+    return DatabaseService.get_db()
