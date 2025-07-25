@@ -9,6 +9,7 @@ services:
       - mongo_data:/data/db
 
   fastapi:
+    restart: always
     build:
       context: .
       dockerfile: BackendFastAPI/Dockerfile
