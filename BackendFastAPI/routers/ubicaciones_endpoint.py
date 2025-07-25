@@ -23,6 +23,51 @@ class LoadResponse(BaseModel):
     task_started: bool = False
 
 # Funciones auxiliares
+def find_xml_file() -> str:
+    """Buscar el archivo XML en múltiples ubicaciones posibles"""
+    possible_paths = [
+        # Ruta relativa desde el archivo actual (desarrollo)
+        os.path.join(os.path.dirname(__file__), "../../CPdescarga.xml"),
+        # Ruta desde la raíz del proyecto (Docker/producción)
+        "/app/CPdescarga.xml",
+        # Ruta desde el directorio actual
+        "./CPdescarga.xml",
+        # Ruta desde el directorio padre
+        "../CPdescarga.xml",
+        # Ruta absoluta común en Docker
+        "/app/BackendFastAPI/CPdescarga.xml",
+        # Ruta en el directorio de trabajo
+        os.path.join(os.getcwd(), "CPdescarga.xml"),
+        # Ruta en el directorio padre del directorio de trabajo
+        os.path.join(os.path.dirname(os.getcwd()), "CPdescarga.xml")
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+    
+    # Si no se encuentra, crear mensaje de error detallado
+    error_msg = "Archivo XML no encontrado. Rutas verificadas:\n"
+    for path in possible_paths:
+        error_msg += f"  - {path} (existe: {os.path.exists(path)})\n"
+    error_msg += f"\nDirectorio actual: {os.getcwd()}\n"
+    error_msg += f"Directorio del script: {os.path.dirname(__file__)}\n"
+    
+    # Listar archivos en algunos directorios para debug
+    try:
+        current_files = os.listdir(os.getcwd())
+        error_msg += f"Archivos en directorio actual: {current_files[:10]}...\n"
+    except:
+        pass
+        
+    try:
+        parent_files = os.listdir(os.path.dirname(os.getcwd()))
+        error_msg += f"Archivos en directorio padre: {parent_files[:10]}...\n"
+    except:
+        pass
+    
+    raise HTTPException(status_code=404, detail=error_msg)
+
 def _get_element_text(parent, tag_name: str) -> str:
     """Obtener texto de un elemento hijo, manejo seguro de None"""
     # Intentar con namespace primero
@@ -112,14 +157,9 @@ async def load_ubicaciones_to_db(db: AsyncIOMotorDatabase) -> Dict:
     collection = db.ubicaciones
     
     try:
-        # Verificar si el archivo XML existe
-        xml_file_path = os.path.join(os.path.dirname(__file__), "../../CPdescarga.xml")
-        
-        if not os.path.exists(xml_file_path):
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Archivo XML no encontrado en: {xml_file_path}"
-            )
+        # Buscar archivo XML
+        xml_file_path = find_xml_file()
+        print(f"Archivo XML encontrado en: {xml_file_path}")  # Log para debug
         
         # Parsear XML
         ubicaciones = parse_xml_to_ubicaciones(xml_file_path)
@@ -358,16 +398,48 @@ async def get_sample_codigos_postales(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error obteniendo muestra: {str(e)}")
 
+@router.get("/debug/file-location", summary="Verificar ubicación del archivo XML")
+async def debug_file_location():
+    """
+    Endpoint de debug para verificar dónde se encuentra el archivo XML
+    """
+    try:
+        # Intentar encontrar el archivo
+        try:
+            xml_file_path = find_xml_file()
+            file_found = True
+            file_size = os.path.getsize(xml_file_path)
+        except HTTPException as e:
+            xml_file_path = None
+            file_found = False
+            file_size = 0
+            error_detail = str(e.detail)
+        
+        # Información del sistema
+        return {
+            "file_found": file_found,
+            "file_path": xml_file_path,
+            "file_size_bytes": file_size,
+            "current_working_directory": os.getcwd(),
+            "script_directory": os.path.dirname(__file__),
+            "error_detail": error_detail if not file_found else None,
+            "environment_info": {
+                "python_executable": os.sys.executable,
+                "platform": os.name
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error verificando archivo: {str(e)}")
+
 @router.get("/debug/xml-sample", summary="Ver muestra de datos raw del XML (debug)")
 async def debug_xml_sample(limit: int = 5):
     """
     Endpoint de debug para ver datos raw del XML antes de procesar
     """
     try:
-        xml_file_path = os.path.join(os.path.dirname(__file__), "../../CPdescarga.xml")
-        
-        if not os.path.exists(xml_file_path):
-            raise HTTPException(status_code=404, detail="Archivo XML no encontrado")
+        # Buscar archivo XML
+        xml_file_path = find_xml_file()
         
         tree = ET.parse(xml_file_path)
         root = tree.getroot()
