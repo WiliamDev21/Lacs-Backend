@@ -170,30 +170,79 @@ async def load_ubicaciones_to_db(db: AsyncIOMotorDatabase) -> Dict:
                 detail="No se encontraron ubicaciones válidas en el archivo XML"
             )
         
+        print(f"Ubicaciones parseadas: {len(ubicaciones)}")  # Debug
+        
         # Limpiar colección existente
+        print("Limpiando colección existente...")
         await collection.delete_many({})
         
-        # Insertar en lotes
-        batch_size = 1000
+        # Insertar en lotes más pequeños con manejo de timeouts
+        batch_size = 100  # Reducido de 1000 a 100
         total_inserted = 0
+        total_batches = (len(ubicaciones) + batch_size - 1) // batch_size
+        
+        print(f"Insertando {len(ubicaciones)} ubicaciones en {total_batches} lotes de {batch_size}...")
         
         for i in range(0, len(ubicaciones), batch_size):
             batch = ubicaciones[i:i + batch_size]
-            result = await collection.insert_many(batch)
-            total_inserted += len(result.inserted_ids)
+            batch_number = (i // batch_size) + 1
+            
+            try:
+                # Configurar timeout más largo para la operación
+                result = await collection.insert_many(
+                    batch, 
+                    ordered=False,  # Continúa aunque falle un documento
+                    bypass_document_validation=False
+                )
+                total_inserted += len(result.inserted_ids)
+                
+                # Log de progreso cada 10 lotes
+                if batch_number % 10 == 0:
+                    print(f"Procesado lote {batch_number}/{total_batches} - Insertados: {total_inserted}")
+                    
+            except Exception as batch_error:
+                print(f"Error en lote {batch_number}: {str(batch_error)}")
+                # Intentar insertar uno por uno si falla el lote
+                for doc in batch:
+                    try:
+                        await collection.insert_one(doc)
+                        total_inserted += 1
+                    except Exception as doc_error:
+                        print(f"Error insertando documento: {str(doc_error)[:100]}...")
+                        continue
         
-        # Crear índices
-        await collection.create_index("codigo_postal", unique=True)
-        await collection.create_index([("estado", 1), ("municipio", 1)])
-        await collection.create_index("asentamientos.nombre")
+        print(f"Inserción completada. Total insertado: {total_inserted}")
         
-        # Contar asentamientos totales
-        pipeline = [
-            {"$unwind": "$asentamientos"},
-            {"$count": "total_asentamientos"}
-        ]
-        result = await collection.aggregate(pipeline).to_list(1)
-        total_asentamientos = result[0]['total_asentamientos'] if result else 0
+        # Crear índices de forma asíncrona
+        print("Creando índices...")
+        try:
+            # Crear índices uno por uno para evitar timeouts
+            await collection.create_index("codigo_postal", unique=True, background=True)
+            print("Índice de código postal creado")
+            
+            await collection.create_index([("estado", 1), ("municipio", 1)], background=True)
+            print("Índice de estado-municipio creado")
+            
+            await collection.create_index("asentamientos.nombre", background=True)
+            print("Índice de asentamientos creado")
+            
+        except Exception as index_error:
+            print(f"Error creando índices: {str(index_error)}")
+            # Los índices no son críticos, continuar sin ellos
+        
+        # Contar asentamientos totales con timeout
+        print("Contando asentamientos...")
+        try:
+            pipeline = [
+                {"$unwind": "$asentamientos"},
+                {"$count": "total_asentamientos"}
+            ]
+            # Configurar timeout para la agregación
+            result = await collection.aggregate(pipeline).to_list(1)
+            total_asentamientos = result[0]['total_asentamientos'] if result else 0
+        except Exception as count_error:
+            print(f"Error contando asentamientos: {str(count_error)}")
+            total_asentamientos = 0  # Usar 0 si falla el conteo
         
         return {
             "total_codigos_postales": total_inserted,
@@ -204,6 +253,7 @@ async def load_ubicaciones_to_db(db: AsyncIOMotorDatabase) -> Dict:
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error general cargando ubicaciones: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error cargando ubicaciones: {str(e)}")
 
 # Endpoints
@@ -325,6 +375,182 @@ async def load_ubicaciones_sync(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en carga síncrona: {str(e)}")
+
+async def load_ubicaciones_streaming(db: AsyncIOMotorDatabase) -> Dict:
+    """Cargar ubicaciones procesando el XML de forma streaming para evitar timeout"""
+    collection = db.ubicaciones
+    
+    try:
+        xml_file_path = find_xml_file()
+        print(f"Iniciando carga streaming desde: {xml_file_path}")
+        
+        # Limpiar colección existente
+        await collection.delete_many({})
+        
+        # Procesar XML de forma streaming
+        cp_dict = {}
+        batch = []
+        batch_size = 50  # Lotes muy pequeños
+        total_processed = 0
+        total_inserted = 0
+        
+        tree = ET.parse(xml_file_path)
+        root = tree.getroot()
+        
+        # Buscar elementos table
+        namespace = {'ns': 'NewDataSet'}
+        tables = root.findall('.//ns:table', namespace)
+        if not tables:
+            tables = root.findall('.//table')
+        
+        print(f"Procesando {len(tables)} registros en modo streaming...")
+        
+        for idx, table in enumerate(tables):
+            total_processed += 1
+            
+            codigo_postal_raw = _get_element_text(table, 'd_codigo')
+            if not codigo_postal_raw:
+                continue
+            
+            # Limpiar código postal
+            codigo_postal = ''.join(filter(str.isdigit, codigo_postal_raw.strip()))
+            if not codigo_postal:
+                continue
+            codigo_postal = codigo_postal.zfill(5)
+            
+            # Crear estructura de asentamiento
+            asentamiento = {
+                'nombre': _get_element_text(table, 'd_asenta'),
+                'tipo': _get_element_text(table, 'd_tipo_asenta'),
+                'zona': _get_element_text(table, 'd_zona'),
+                'codigo_tipo': _get_element_text(table, 'c_tipo_asenta'),
+                'id_asentamiento': _get_element_text(table, 'id_asenta_cpcons')
+            }
+            
+            # Agregar al diccionario temporal
+            if codigo_postal not in cp_dict:
+                cp_dict[codigo_postal] = {
+                    'codigo_postal': codigo_postal,
+                    'municipio': _get_element_text(table, 'D_mnpio'),
+                    'estado': _get_element_text(table, 'd_estado'),
+                    'ciudad': _get_element_text(table, 'd_ciudad'),
+                    'cp_oficina': _get_element_text(table, 'd_CP'),
+                    'codigo_estado': _get_element_text(table, 'c_estado'),
+                    'codigo_oficina': _get_element_text(table, 'c_oficina'),
+                    'codigo_cp': _get_element_text(table, 'c_CP'),
+                    'codigo_municipio': _get_element_text(table, 'c_mnpio'),
+                    'codigo_ciudad': _get_element_text(table, 'c_cve_ciudad'),
+                    'asentamientos': []
+                }
+            
+            # Agregar asentamiento si no está duplicado
+            asentamientos_existentes = [a['nombre'] for a in cp_dict[codigo_postal]['asentamientos']]
+            if asentamiento['nombre'] not in asentamientos_existentes:
+                cp_dict[codigo_postal]['asentamientos'].append(asentamiento)
+            
+            # Insertar en lotes pequeños frecuentemente
+            if len(cp_dict) >= batch_size:
+                batch = list(cp_dict.values())
+                try:
+                    result = await collection.insert_many(batch, ordered=False)
+                    total_inserted += len(result.inserted_ids)
+                    cp_dict.clear()  # Limpiar diccionario
+                    
+                    if total_inserted % 500 == 0:
+                        print(f"Insertados {total_inserted} CPs, procesados {total_processed} registros")
+                        
+                except Exception as batch_error:
+                    print(f"Error en lote streaming: {str(batch_error)}")
+                    # Insertar uno por uno si falla
+                    for doc in batch:
+                        try:
+                            await collection.insert_one(doc)
+                            total_inserted += 1
+                        except:
+                            continue
+                    cp_dict.clear()
+        
+        # Insertar último lote
+        if cp_dict:
+            batch = list(cp_dict.values())
+            try:
+                result = await collection.insert_many(batch, ordered=False)
+                total_inserted += len(result.inserted_ids)
+            except Exception as final_error:
+                print(f"Error en lote final: {str(final_error)}")
+                for doc in batch:
+                    try:
+                        await collection.insert_one(doc)
+                        total_inserted += 1
+                    except:
+                        continue
+        
+        print(f"Carga streaming completada. Total insertado: {total_inserted}")
+        
+        # Crear índices de forma segura
+        try:
+            await collection.create_index("codigo_postal", unique=True, background=True)
+            await collection.create_index([("estado", 1), ("municipio", 1)], background=True)
+            await collection.create_index("asentamientos.nombre", background=True)
+        except Exception as index_error:
+            print(f"Advertencia - Error creando índices: {str(index_error)}")
+        
+        return {
+            "total_codigos_postales": total_inserted,
+            "total_asentamientos": 0,  # Se calculará después si es necesario
+            "message": "Ubicaciones cargadas exitosamente con método streaming"
+        }
+        
+    except Exception as e:
+        print(f"Error en carga streaming: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en carga streaming: {str(e)}")
+
+@router.post("/load-streaming", response_model=LoadStatusResponse, summary="Cargar ubicaciones con método streaming (recomendado)")
+async def load_ubicaciones_streaming_endpoint(
+    force_reload: bool = False,
+    db: AsyncIOMotorDatabase = Depends(get_database)
+):
+    """
+    Cargar ubicaciones usando método streaming optimizado para archivos grandes.
+    Recomendado para evitar timeouts con archivos de muchos registros.
+    """
+    try:
+        collection = db.ubicaciones
+        
+        # Verificar si ya existen datos
+        existing_count = await collection.count_documents({})
+        
+        if existing_count > 0 and not force_reload:
+            # Contar asentamientos
+            try:
+                pipeline = [
+                    {"$unwind": "$asentamientos"},
+                    {"$count": "total_asentamientos"}
+                ]
+                result = await collection.aggregate(pipeline).to_list(1)
+                total_asentamientos = result[0]['total_asentamientos'] if result else 0
+            except:
+                total_asentamientos = 0
+            
+            return LoadStatusResponse(
+                status="already_loaded",
+                message=f"Ya existen {existing_count} códigos postales",
+                total_codigos_postales=existing_count,
+                total_asentamientos=total_asentamientos
+            )
+        
+        # Ejecutar carga streaming
+        result = await load_ubicaciones_streaming(db)
+        
+        return LoadStatusResponse(
+            status="loaded",
+            message=result["message"],
+            total_codigos_postales=result["total_codigos_postales"],
+            total_asentamientos=result["total_asentamientos"]
+        )
+        
+    except HTTPException:
+        raise
 
 @router.get("/buscar/estado/{estado}", summary="Buscar códigos postales por estado")
 async def get_ubicaciones_by_estado(

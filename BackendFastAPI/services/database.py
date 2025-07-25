@@ -7,7 +7,16 @@ class DatabaseService:
 
     @classmethod
     def connect(cls, uri: str, db_name: str):
-        cls._client = AsyncIOMotorClient(uri)
+        # Configurar cliente con timeouts más largos para operaciones masivas
+        cls._client = AsyncIOMotorClient(
+            uri,
+            serverSelectionTimeoutMS=30000,  # 30 segundos
+            connectTimeoutMS=30000,          # 30 segundos  
+            socketTimeoutMS=300000,          # 5 minutos para operaciones largas
+            maxPoolSize=50,                  # Más conexiones concurrentes
+            retryWrites=True,                # Reintentar escrituras automáticamente
+            w='majority'                     # Esperar confirmación de escritura
+        )
         cls._db = cls._client[db_name]
 
     @classmethod
